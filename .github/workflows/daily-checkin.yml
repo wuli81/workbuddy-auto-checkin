@@ -1,6 +1,9 @@
 name: WorkBuddy 每日签到
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     # 每天北京时间 09:07 (UTC 01:07)，避开整点拥堵
     - cron: '7 1 * * *'
