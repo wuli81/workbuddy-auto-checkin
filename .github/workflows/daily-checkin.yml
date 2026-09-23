@@ -4,8 +4,8 @@ on:
   schedule:
     # 每天北京时间 09:07 (UTC 01:07)，避开整点拥堵
     - cron: '7 1 * * *'
-    # 临时诊断：每小时第 45 分钟触发，验证独立仓库 scheduler
-    - cron: '45 * * * *'
+    # 临时诊断：每小时第 15 分钟触发，验证独立仓库 scheduler
+    - cron: '15 * * * *'
   workflow_dispatch: # 支持手动触发
 
 jobs:
