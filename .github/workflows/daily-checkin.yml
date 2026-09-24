@@ -1,14 +1,9 @@
 name: WorkBuddy 每日签到
 
 on:
-  push:
-    branches:
-      - main
   schedule:
     # 每天北京时间 09:07 (UTC 01:07)，避开整点拥堵
     - cron: '7 1 * * *'
-    # 临时诊断：每 5 分钟一个非整点窗口，验证 scheduler 注册
-    - cron: '3,8,13,18,23,28,33,38,43,48,53,58 * * * *'
   workflow_dispatch: # 支持手动触发
 
 jobs:
