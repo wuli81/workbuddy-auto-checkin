@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 from workbuddy_auth import AuthError, normalize_auth, read_auth, write_auth, sync_github, github_preflight
+from workbuddy_auth import safe_print as print
 
 
 def main():

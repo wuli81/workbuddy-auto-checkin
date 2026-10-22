@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from workbuddy_auth import AuthError, auth_lock, normalize_auth, write_auth
+from workbuddy_auth import AuthError, auth_lock, normalize_auth, write_auth, safe_print as print
 
 CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 

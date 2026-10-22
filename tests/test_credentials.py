@@ -168,6 +168,13 @@ class CredentialTests(unittest.TestCase):
         for value in ('fake-access-token', 'fake-refresh-token', 'test-uid', '13812345678'):
             self.assertNotIn(value, output.getvalue())
 
+    def test_legacy_windows_output_encoding_does_not_crash(self):
+        output = io.BytesIO()
+        stream = io.TextIOWrapper(output, encoding='cp1252', write_through=True)
+        wb.print('签到状态 fake-access-token', file=stream)
+        self.assertNotIn(b'fake-access-token', output.getvalue())
+        stream.detach()
+
     def test_http_error_body_never_leaks(self):
         import urllib.error
         error = urllib.error.HTTPError('https://example.test', 401, 'no', {}, io.BytesIO(b'fake-refresh-token 13812345678'))

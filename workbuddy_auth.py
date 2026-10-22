@@ -1,5 +1,6 @@
 """Credential boundary: fixed errors, local decryption, portable minimal exports."""
 import base64
+import builtins
 import contextlib
 import json
 import math
@@ -7,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -32,6 +34,15 @@ def redact(value):
     text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[phone hidden]", text)
     text = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "[token hidden]", text)
     return text
+
+
+def safe_print(*values, **kwargs):
+    """Redact first, then tolerate Windows pipes using a legacy encoding."""
+    encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None)
+    values = [redact(value) for value in values]
+    if encoding:
+        values = [value.encode(encoding, errors="backslashreplace").decode(encoding) for value in values]
+    builtins.print(*values, **kwargs)
 
 
 def epoch_seconds(value):

@@ -47,14 +47,9 @@ import base64
 import argparse
 import urllib.request
 import urllib.error
-import builtins
 from datetime import datetime, timezone, timedelta
 from workbuddy_auth import (AuthError, auth_lock, epoch_seconds, read_auth,
-                            write_auth, redact, remember, token_value)
-
-
-def print(*values, **kwargs):
-    builtins.print(*(redact(value) for value in values), **kwargs)
+                            write_auth, redact, remember, token_value, safe_print as print)
 
 # ─── 上游常量（来自 cpa-plugin/workbuddy/main.go + billing.go）───────────────
 
