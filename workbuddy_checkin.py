@@ -47,7 +47,9 @@ import base64
 import argparse
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from workbuddy_auth import (AuthError, auth_lock, epoch_seconds, read_auth,
+                            write_auth, redact, remember, token_value, safe_print as print)
 
 # ─── 上游常量（来自 cpa-plugin/workbuddy/main.go + billing.go）───────────────
 
@@ -80,46 +82,19 @@ HTTP_TIMEOUT = 30
 
 # Bark 推送通知（通过环境变量 BARK_URL 配置）
 BARK_URL = os.environ.get("BARK_URL", "")
+remember(BARK_URL)
 
 
 # ─── 凭证文件读写 ────────────────────────────────────────────────────────────
 
 def load_auth(path):
-    """读取凭证 JSON，兼容嵌套（插件格式）和扁平（UI 格式）两种形状。"""
-    with open(path, "r") as f:
-        raw = f.read()
-    data = json.loads(raw)
-
-    # 嵌套形状: {"auth": {...}, "account": {...}}
-    if isinstance(data.get("auth"), dict) and data["auth"].get("accessToken"):
-        return data
-
-    # 扁平形状: {"accessToken": "...", ...}
-    if data.get("accessToken"):
-        return {
-            "auth": {
-                "accessToken": data.get("accessToken", ""),
-                "refreshToken": data.get("refreshToken", ""),
-                "expiresAt": data.get("expiresAt", 0),
-                "domain": data.get("domain", ""),
-            },
-            "account": {
-                "uid": data.get("uid", ""),
-                "enterpriseId": data.get("enterpriseId", ""),
-                "nickname": data.get("nickname", ""),
-            },
-            "disabled": data.get("disabled", False),
-        }
-
-    raise ValueError(f"凭证文件 {path} 缺少 accessToken")
+    """兼容明文与本机 suite 1 信封；只保留必要认证字段。"""
+    return read_auth(path)
 
 
 def save_auth(path, auth_data):
-    """原子写回凭证文件（先写临时文件再 rename）。"""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(auth_data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    """先持久化本地，再按需立即写回 GitHub Secret。"""
+    write_auth(path, auth_data)
 
 
 def list_auth_files(auth_dir):
@@ -179,25 +154,32 @@ def http_post_json(url, body=None, headers=None, timeout=HTTP_TIMEOUT):
         try:
             env = json.loads(raw)
             if isinstance(env, dict) and env.get("code", 0) != 0:
-                return None, e.code, f"code={env.get('code')} msg={env.get('msg', '')}"
+                code = env.get("code")
+                if is_session_dead(str(env.get("msg", ""))):
+                    code = 12153
+                return None, e.code, f"code={code}" if isinstance(code, int) else "上游业务错误"
         except (json.JSONDecodeError, ValueError):
             pass
-        return None, e.code, f"HTTP {e.code}: {raw[:200]}"
-    except urllib.error.URLError as e:
-        return None, 0, f"网络错误: {e.reason}"
+        return None, e.code, f"HTTP {e.code}"
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None, 0, "网络请求失败"
 
     # 解析 {code, msg, data} 信封
     try:
         env = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
-        return None, status, f"JSON 解析失败: {raw[:200]}"
+        return None, status, "上游返回无效 JSON"
 
     if not isinstance(env, dict):
         return env, status, None
 
     code = env.get("code", 0)
     if code != 0:
-        return None, status, f"code={code} msg={env.get('msg', '')}"
+        if is_session_dead(str(env.get("msg", ""))):
+            code = 12153
+        if code == 11216 or "已签到" in str(env.get("msg", "")) or "already" in str(env.get("msg", "")).lower():
+            return None, status, "今日已签到（上游确认）"
+        return None, status, f"code={code}" if isinstance(code, int) else "上游业务错误"
 
     return env.get("data"), status, None
 
@@ -207,7 +189,7 @@ def billing_headers(auth_data):
     auth = auth_data.get("auth", {})
     acct = auth_data.get("account", {})
     headers = {
-        "Authorization": f"Bearer {auth.get('accessToken', '')}",
+        "Authorization": f"Bearer {token_value(auth.get('accessToken'), required=True)}",
     }
     if acct.get("uid"):
         headers["X-User-Id"] = acct["uid"]
@@ -223,7 +205,7 @@ def billing_headers(auth_data):
 
 def is_token_expired(auth_data, margin=TOKEN_REFRESH_MARGIN):
     """检查 token 是否已过期或即将过期。"""
-    expires_at = auth_data.get("auth", {}).get("expiresAt", 0)
+    expires_at = epoch_seconds(auth_data.get("auth", {}).get("expiresAt", 0))
     if expires_at == 0:
         return False  # 未知过期时间，不主动刷新
     return time.time() + margin > expires_at
@@ -239,7 +221,9 @@ def is_session_dead(error_msg):
 
 def refresh_token(path, auth_data):
     """刷新 access token 并落盘。返回 (success, message)。"""
-    refresh_token_val = auth_data.get("auth", {}).get("refreshToken", "")
+    if auth_data.get("disabled"):
+        return False, "会话已禁用，需要重新登录"
+    refresh_token_val = token_value(auth_data.get("auth", {}).get("refreshToken", ""))
     if not refresh_token_val:
         return False, "无 refreshToken，无法刷新"
 
@@ -256,26 +240,34 @@ def refresh_token(path, auth_data):
     data, status, err = http_post_json(url, body={}, headers=headers)
 
     if err:
-        if status == 401 and is_session_dead(err):
+        if is_session_dead(err):
             auth_data["disabled"] = True
             auth_data["note"] = "Session dead (12153): re-login required"
             save_auth(path, auth_data)
             return False, "会话已失效 (12153)，已标记 disabled，需重新登录"
         return False, f"刷新失败 (HTTP {status}): {err}"
 
-    if not data or not data.get("accessToken"):
+    if not isinstance(data, dict) or not data.get("accessToken"):
         return False, "刷新响应中缺少 accessToken"
 
     # 更新凭证
-    auth_data["auth"]["accessToken"] = data["accessToken"]
-    if data.get("refreshToken"):
-        auth_data["auth"]["refreshToken"] = data["refreshToken"]
-    if data.get("domain"):
-        auth_data["auth"]["domain"] = data["domain"]
-
-    expires_in = data.get("expiresIn", 0)
-    if expires_in > 0:
-        auth_data["auth"]["expiresAt"] = int(time.time()) + expires_in
+    new_access = token_value(data["accessToken"], required=True)
+    new_refresh = token_value(data.get("refreshToken") or refresh_token_val)
+    auth_data["auth"]["accessToken"] = new_access
+    auth_data["auth"]["refreshToken"] = new_refresh
+    # Drop stale expiry even if the server omits expiresIn. Prefer JWT exp.
+    expires_at = 0
+    try:
+        expires_at = epoch_seconds(json.loads(base64.urlsafe_b64decode(new_access.split(".")[1] + "===" )).get("exp"))
+    except (ValueError, IndexError, TypeError, AttributeError):
+        pass
+    try:
+        expires_in = float(data.get("expiresIn", 0))
+        if not expires_at and 0 < expires_in < 10 * 365 * 86400:
+            expires_at = int(time.time() + expires_in)
+    except (ValueError, TypeError):
+        pass
+    auth_data["auth"]["expiresAt"] = expires_at
 
     save_auth(path, auth_data)
     return True, "Token 已刷新"
@@ -283,7 +275,7 @@ def refresh_token(path, auth_data):
 
 def ensure_token_valid(path, auth_data):
     """如果 token 即将过期则自动刷新。返回更新后的 auth_data。"""
-    if is_token_expired(auth_data):
+    if not auth_data.get("disabled") and is_token_expired(auth_data):
         print(f"  [刷新] Token 即将过期，自动刷新...")
         ok, msg = refresh_token(path, auth_data)
         if ok:
@@ -374,7 +366,13 @@ def checkin_one_account(path, auth_data, _retry_on_401=True):
         return result
 
     # 确保 token 有效（过期前 5 天就刷新，防止服务端提前撤销）
+    proactive_refresh = is_token_expired(auth_data)
     auth_data = ensure_token_valid(path, auth_data)
+    if auth_data.get("disabled"):
+        result.update(success=False, error="会话已失效 (12153)，需要重新登录")
+        return result
+    if proactive_refresh:
+        _retry_on_401 = False
 
     # 查询签到状态
     ci_status, ci_err = fetch_checkin_status(auth_data)
@@ -605,11 +603,12 @@ def _format_token(token):
     """脱敏显示 token。"""
     if not token:
         return "(空)"
-    return token[:16] + "...(已隐藏)"
+    return "(已隐藏)"
 
 
 def _format_expires(expires_at):
     """格式化过期时间。"""
+    expires_at = epoch_seconds(expires_at)
     if not expires_at:
         return "(未知)"
     dt = datetime.fromtimestamp(expires_at)
@@ -656,14 +655,16 @@ def print_credit_report(uid_filter, auth_dir, as_json=False):
     files = list_auth_files(auth_dir)
     if not files:
         print("未找到凭证文件")
-        return
+        return 1
 
     reports = []
+    failed = False
     for path in files:
         try:
             auth_data = load_auth(path)
         except (json.JSONDecodeError, ValueError, OSError) as e:
             print(f"  跳过 {os.path.basename(path)}: {e}")
+            failed = True
             continue
 
         acct = auth_data.get("account", {})
@@ -673,7 +674,16 @@ def print_credit_report(uid_filter, auth_dir, as_json=False):
             continue
 
         auth_data = ensure_token_valid(path, auth_data)
-        credits, err = fetch_user_resource(auth_data)
+        if auth_data.get("disabled"):
+            credits, err = None, "会话已禁用，需要重新登录"
+        else:
+            credits, err = fetch_user_resource(auth_data)
+            if err and "401" in err:
+                ok, message = refresh_token(path, auth_data)
+                if ok:
+                    credits, err = fetch_user_resource(auth_data)
+                else:
+                    err = message
 
         report = {
             "uid": uid,
@@ -683,6 +693,7 @@ def print_credit_report(uid_filter, auth_dir, as_json=False):
         }
 
         if err:
+            failed = True
             report["error"] = err
             report["total_remain"] = 0
         else:
@@ -696,11 +707,11 @@ def print_credit_report(uid_filter, auth_dir, as_json=False):
 
     if as_json:
         print(json.dumps(reports, indent=2, ensure_ascii=False))
-        return
+        return 1 if failed else 0
 
     if not reports:
         print(f"未找到 UID 为 {uid_filter} 的账号")
-        return
+        return 1
 
     # 人类可读格式
     print(f"\n{'='*60}")
@@ -726,6 +737,7 @@ def print_credit_report(uid_filter, auth_dir, as_json=False):
     total = sum(r.get("total_remain", 0) for r in reports if not r.get("error"))
     print(f"  总剩余积分: {total} ({len(reports)} 个账号)")
     print(f"{'='*60}\n")
+    return 1 if failed else 0
 
 
 # ─── JWT 辅助（判断 token 区域，来自 models.go isGlobalToken）─────────────────
@@ -841,7 +853,7 @@ def send_bark_notification(success_n, already_n, fail_n, global_n, skipped_n, re
     bark_base = BARK_URL.rstrip("/")
     payload = {
         "title": f"{icon} {title}",
-        "body": body,
+        "body": redact(body),
         "group": "WorkBuddy",
         "icon": "https://www.codebuddy.cn/favicon.ico",
     }
@@ -861,7 +873,7 @@ def send_bark_notification(success_n, already_n, fail_n, global_n, skipped_n, re
             else:
                 print(f"  [通知] Bark 推送失败 (HTTP {resp.status})")
     except Exception as e:
-        print(f"  [通知] Bark 推送异常: {e}")
+        print("  [通知] Bark 推送失败")
 
 
 # ─── 主命令 ────────────────────────────────────────────────────────────────────
@@ -873,7 +885,7 @@ def cmd_signin(args):
     if not files:
         print(f"未在 {auth_dir}/ 找到凭证文件")
         print("请将 workbuddy-<uid>.json 放入该目录")
-        return
+        return 1
 
     print(f"\n{'='*60}")
     print(f"  WorkBuddy 批量签到 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -888,7 +900,7 @@ def cmd_signin(args):
             auth_data = load_auth(path)
         except (json.JSONDecodeError, ValueError, OSError) as e:
             print(f"  跳过 {os.path.basename(path)}: {e}")
-            skipped_n += 1
+            fail_n += 1
             continue
 
         result = checkin_one_account(path, auth_data)
@@ -905,6 +917,8 @@ def cmd_signin(args):
                 global_n += 1
             else:
                 skipped_n += 1
+                if reason == "disabled":
+                    fail_n += 1
         elif result.get("success"):
             success_n += 1
         else:
@@ -935,7 +949,7 @@ def cmd_credit(args):
     elif uid_filter and uid_filter.startswith("-"):
         uid_filter = None
     as_json = args.json
-    print_credit_report(uid_filter, auth_dir, as_json=as_json)
+    return print_credit_report(uid_filter, auth_dir, as_json=as_json)
 
 
 def cmd_trial(args):
@@ -982,22 +996,26 @@ def cmd_refresh(args):
     files = list_auth_files(auth_dir)
     if not files:
         print(f"未在 {auth_dir}/ 找到凭证文件")
-        return
+        return 1
 
     print(f"\n  刷新所有 token — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    failed = False
     for path in files:
         try:
             auth_data = load_auth(path)
         except (json.JSONDecodeError, ValueError, OSError) as e:
             print(f"  跳过 {os.path.basename(path)}: {e}")
+            failed = True
             continue
 
         nickname = auth_data.get("account", {}).get("nickname", "")
         uid = auth_data.get("account", {}).get("uid", "") or uid_from_filename(path)
         ok, msg = refresh_token(path, auth_data)
+        failed |= not ok
         status = "✓" if ok else "✗"
         print(f"  {status} {nickname}({uid}): {msg}")
     print()
+    return 1 if failed else 0
 
 
 def cmd_cron(args):
@@ -1014,7 +1032,7 @@ def cmd_cron(args):
         # 计算下次执行时间
         next_run = now.replace(hour=hour, minute=0, second=0, microsecond=0)
         if next_run <= now:
-            next_run = next_run.replace(day=now.day + 1)
+            next_run += timedelta(days=1)
 
         wait_seconds = (next_run - now).total_seconds()
         print(f"  下次执行: {next_run.strftime('%Y-%m-%d %H:%M')} (等待 {int(wait_seconds)} 秒)")
@@ -1028,7 +1046,11 @@ def cmd_cron(args):
         args.auth_dir = auth_dir
         args.uid = None
         args.json = False
-        cmd_signin(args)
+        try:
+            with auth_lock(auth_dir):
+                cmd_signin(args)
+        except (AuthError, SystemExit, OSError):
+            print("本次签到失败；凭证状态已保留，将等待下一次计划")
 
 
 def main():
@@ -1064,7 +1086,7 @@ def main():
     p_refresh.add_argument("auth_dir", nargs="?", default="auths", help="凭证目录")
 
     p_cron = sub.add_parser("cron", help="定时模式")
-    p_cron.add_argument("hour", type=int, help="每天执行的小时 (0-23)")
+    p_cron.add_argument("hour", type=int, choices=range(24), help="每天执行的小时 (0-23)")
     p_cron.add_argument("auth_dir", nargs="?", default="auths", help="凭证目录")
 
     args = parser.parse_args()
@@ -1083,11 +1105,22 @@ def main():
 
     cmd_func = commands.get(args.command)
     if cmd_func:
-        cmd_func(args)
+        if args.command == "cron":
+            return cmd_func(args)
+        directory = args.auth_dir
+        if args.command == "credit" and args.uid and (os.path.isdir(args.uid) or "/" in args.uid or "\\" in args.uid):
+            directory = args.uid
+        try:
+            with auth_lock(directory):
+                return cmd_func(args)
+        except (AuthError, OSError) as exc:
+            print(str(exc) if isinstance(exc, AuthError) else "本地凭证操作失败，请检查权限", file=sys.stderr)
+            return 1
     else:
         parser.print_help()
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+

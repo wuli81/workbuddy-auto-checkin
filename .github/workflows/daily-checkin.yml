@@ -1,44 +1,65 @@
 name: WorkBuddy 每日签到
 
 on:
-  schedule:
-    # 每天北京时间 09:07 (UTC 01:07)，避开整点拥堵
-    - cron: '7 1 * * *'
-  workflow_dispatch: # 支持手动触发
+  # 每日签到已迁至持久化 VPS；仅保留手动入口，避免双端轮换同一会话。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# schedule/manual/不同分支运行不能并发轮换同一个 refreshToken。
+concurrency:
+  group: workbuddy-auth-state
+  cancel-in-progress: false
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 写入凭证
+      - name: 写入最小凭证并检查 Secret 写权限
+        id: state
         env:
           WORKBUDDY_AUTH: ${{ secrets.WORKBUDDY_AUTH }}
+          GH_TOKEN: ${{ secrets.WORKBUDDY_SECRETS_TOKEN }}
         run: |
-          mkdir -p auths
-          if [ -n "$WORKBUDDY_AUTH" ]; then
-            echo "$WORKBUDDY_AUTH" > auths/workbuddy-auth.json
-            echo "凭证已写入"
-          else
-            echo "未设置 WORKBUDDY_AUTH secret，跳过"
-            exit 1
-          fi
+          umask 077
+          python3 auth_state.py prepare "$RUNNER_TEMP/workbuddy-auth/workbuddy-auth.json"
+          # 先写当前凭证验证权限，成功后才允许调用会轮换 token 的端点。
+          python3 auth_state.py sync --preflight "$RUNNER_TEMP/workbuddy-auth/workbuddy-auth.json"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: 执行签到 + Bark 通知
+        if: steps.state.outputs.ready == 'true'
         env:
           BARK_URL: ${{ secrets.BARK_URL }}
-        run: python3 workbuddy_checkin.py signin
+          GH_TOKEN: ${{ secrets.WORKBUDDY_SECRETS_TOKEN }}
+          WORKBUDDY_PERSIST_GITHUB: '1'
+        run: python3 workbuddy_checkin.py signin "$RUNNER_TEMP/workbuddy-auth"
 
       - name: 查询积分
-        run: python3 workbuddy_checkin.py credit
+        env:
+          GH_TOKEN: ${{ secrets.WORKBUDDY_SECRETS_TOKEN }}
+          WORKBUDDY_PERSIST_GITHUB: '1'
+        run: python3 workbuddy_checkin.py credit "$RUNNER_TEMP/workbuddy-auth"
 
-      - name: 清理凭证
+      - name: 最后一次保存凭证（失败状态也需保存）
+        if: always() && steps.state.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WORKBUDDY_SECRETS_TOKEN }}
+        run: python3 auth_state.py sync "$RUNNER_TEMP/workbuddy-auth/workbuddy-auth.json"
+
+      - name: 清理临时凭证
         if: always()
-        run: rm -rf auths/
+        run: rm -rf -- "$RUNNER_TEMP/workbuddy-auth"
+

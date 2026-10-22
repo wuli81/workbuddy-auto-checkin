@@ -1,196 +1,125 @@
-# workbuddy-checkin
+# WorkBuddy 自动签到
 
-腾讯 CodeBuddy (WorkBuddy) 独立签到 / 积分查询脚本。
+独立的 WorkBuddy / CodeBuddy 签到、积分查询和会话刷新工具。正常云端运行只用 Python 标准库，不需要安装或启动桌面客户端。
 
-从 [cpa-plugin/workbuddy](https://github.com/Sliverkiss/cpa-plugin/tree/main/workbuddy) 插件的 `billing.go` + `keepalive.go` 逻辑中提取核心 API 调用，重写为**纯 Python 标准库**实现，零第三方依赖，适合沙箱 / 容器 / cron 部署。
+## 认证与长期运行方案
 
-## 功能
+2026-10-22 检查发现两类独立问题：
 
-- **多账号批量签到** — CN 账号每日签到，自动跳过 Global / 已禁用账号
-- **积分查询** — 多套餐包聚合，人类可读日报 + JSON 格式
-- **Token 自动刷新** — 过期前 24h 预刷新，refreshToken 轮换落盘
-- **会话失效检测** — 12153 错误自动标记 disabled，避免无效请求
-- **Trial 领取** — Global 账号一次性 250 积分专家加油包
-- **定时模式** — 内置 cron，每天指定时间自动签到
-- **凭证兼容** — 同时支持嵌套（插件 OAuth）和扁平（UI 导入）两种 JSON 格式
+- 服务端返回 `12153` 表示会话已失效，需要重新登录。修改本地解密代码不能恢复已撤销的会话。
+- 新客户端将 accessToken、refreshToken 以及部分个人信息保存为 `{$wbEncrypted:1,envelope:"..."}`。它是本地静态存储格式，不能直接作为 HTTP Bearer token，也不证明远端认证协议发生了同样的变化。
+- 旧 Actions 工作流从固定 Secret 生成临时文件。刷新后的 refreshToken 如果不写回，下一次运行仍使用旧值。
 
-## 快速开始
+**建议长期使用 VPS + 持久凭证文件 + systemd timer。** 每次轮换先原子写盘，目录锁阻止同机并发，运行不依赖桌面客户端或 GitHub Secrets 写权限。定时器使用北京时间，服务器关机期间错过的任务会在恢复后补触发；不会补签历史日期。
 
-### 1. 获取凭证（二选一）
+GitHub Actions 也支持即时写回 Secret，但 Secret 不是事务数据库：服务端已轮换、runner 突然销毁而尚未写回时，仍可能需要重新登录。GitHub 定时触发也可能延迟。不要承诺 token 永久有效，服务端仍可撤销会话。
 
-#### 方式 A: 交互式登录（推荐）
+## 获取最小凭证
+
+### 独立浏览器登录（适合长期无人值守）
 
 ```bash
-chmod +x login.sh
-./login.sh              # 交互式选择区域
-./login.sh cn           # 直接登录 CN (codebuddy.cn)
-./login.sh global       # 直接登录 Global (workbuddy.ai)
-./login.sh manual       # 手动输入已有 Token
+python3 login_quick.py cn --auth-dir auths
+# 国际版使用 global
+# macOS/Linux 也可 ./login.sh cn --auth-dir auths
 ```
 
-登录流程：
-1. 脚本获取授权 State，生成登录链接
-2. 浏览器打开登录页面，用户完成登录
-3. 脚本轮询 Token 端点，自动获取 accessToken / refreshToken
-4. 获取账号信息（UID、昵称、企业 ID）
-5. 保存凭证到 `auths/workbuddy-<uid>.json`
-6. 查询积分验证凭证有效性
+按终端给出的一次性链接在浏览器完成授权。此流程不依赖桌面安装，仍需要本人完成登录，不能在 Actions 中无人交互地重新登录。独立自动化会话可减少桌面端与服务器同时轮换同一 refreshToken 的冲突；服务端的会话政策仍可能影响它。
 
-#### 方式 B: 手动导入凭证
+登录脚本只保存 accessToken、refreshToken、过期时间、domain、uid、enterpriseId 和 disabled；不打印 token 前缀、手机号或昵称，不删除其他账号。文件保存在指定目录，避免旧版写死容器路径的问题。默认输出目录为当前目录的 `auths/`。
 
-从 CPA workbuddy 插件或 CPA-Manager-Plus 面板导出凭证文件，放入 `auths/` 目录：
+### 从已登录的桌面客户端导出
 
-```
-auths/
-  workbuddy-<uid1>.json
-  workbuddy-<uid2>.json
+Windows PowerShell 示例（把 python 替换为本机 Python 命令）：
+
+```powershell
+python auth_state.py export "$env:LOCALAPPDATA\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info" "auths\workbuddy-auth.json"
 ```
 
-凭证文件格式（嵌套，与 CPA 插件兼容）：
+- 兼容旧明文和新版 accessToken / refreshToken 信封。加密昵称和手机号直接丢弃，不需要解密。
+- 新版仅支持经过认证验证的 suite 1 / sym-v1 字段信封；未来未知格式会明确失败，不猜测解密方式。
+- 解密在匹配版本 WorkBuddy 自带 Electron 的子进程中完成；密钥不导出、不保存、不上传。必要时通过 `WORKBUDDY_EXE` 指定可信的客户端可执行文件。
+- 实现使用客户端原生存储接口获取构建材料，校验 keyId，并使用相应 AAD 验证 AES-256-GCM 标签。其版本兼容性不能当作官方长期 API 保证。
+- 导出不会修改源文件，不覆盖已有目标文件；会生成用于自动化的**明文最小凭证**。保护这个目录，按凭证管理，不要提交仓库、发聊天、上传 artifact 或使用 Actions cache 保存。
+- VPS / GitHub 上没有匹配客户端时，请传输已经导出的最小凭证。单独复制加密信封不能解密，复制桌面安装包或导出全局解密密钥也不是推荐部署方式。
+- 一份 refreshToken 只由一个自动化实例管理。桌面端和服务器共享同一会话可能出现轮换冲突，优先采用独立浏览器登录。
 
-```json
-{
-  "auth": {
-    "accessToken": "...",
-    "refreshToken": "...",
-    "expiresAt": 1234567890,
-    "domain": "codebuddy.cn"
-  },
-  "account": {
-    "uid": "...",
-    "enterpriseId": "...",
-    "nickname": "..."
-  },
-  "disabled": false
-}
-```
+支持嵌套或扁平旧 JSON。过期时间自动兼容秒/毫秒。示例参见 [auth.example.json](auth.example.json)。
 
-也支持扁平格式：
-
-```json
-{
-  "accessToken": "...",
-  "refreshToken": "...",
-  "expiresAt": 1234567890,
-  "domain": "codebuddy.cn",
-  "uid": "...",
-  "nickname": "..."
-}
-```
-
-> `domain` 决定区域路由：`codebuddy.cn` → CN（支持签到），`workbuddy.ai` → Global（仅 trial）。
-
-### 2. 运行
+## 使用
 
 ```bash
-# 批量签到（所有账号）
-python3 workbuddy_checkin.py signin
-
-# 积分日报（人类可读）
-python3 workbuddy_checkin.py credit
-
-# 积分日报（JSON 格式）
-python3 workbuddy_checkin.py credit -j
-
-# 指定账号积分
-python3 workbuddy_checkin.py credit <uid>
-
-# 领取 trial（仅 Global 账号）
-python3 workbuddy_checkin.py trial <uid>
-
-# 强制刷新所有 token
-python3 workbuddy_checkin.py refresh
-
-# 定时模式（每天 9 点签到）
-python3 workbuddy_checkin.py cron 9
+python3 workbuddy_checkin.py signin auths
+python3 workbuddy_checkin.py credit auths
+python3 workbuddy_checkin.py credit auths -j
+python3 workbuddy_checkin.py refresh auths
+python3 workbuddy_checkin.py trial <uid> auths  # 仅 Global
+python3 workbuddy_checkin.py cron 9 auths       # 当前系统时区；VPS 推荐 systemd
 ```
 
-### 3. Docker 部署
+- 从 `workbuddy-*.json` / `workbuddy.json` 读取账号；CN 支持签到，Global 保留 trial 和积分功能。
+- 到期前 5 天预刷新；401 时最多再刷新重试一次。12153 在 HTTP 200 或 401 响应中都视为会话失效，保存 disabled，停止继续调用。
+- 刷新落盘前使用随机临时文件、flush/fsync 和原子替换；POSIX 凭证文件权限 0600。使用独立账号和受限目录管理 Windows ACL。
+- 无效凭证、已失效账号、缺少文件、刷新或持久化失败会返回失败状态，避免任务假成功。
+- 凭证值、个人信息和上游原始错误响应不进入日志；Bark 请求异常不输出包含设备 key 的 URL。Bark 通知内容也经过脱敏。
+- 内置 cron 修复跨月底日期计算；任务失败后继续等待下次执行。服务端会话失效仍须本人重新授权。
+
+## VPS：推荐部署
+
+模板位于 [deploy/](deploy/)。以下示例假定代码放在 `/opt/workbuddy-auto-checkin`：
 
 ```bash
-# 准备凭证目录
-mkdir -p auths
-# 把 workbuddy-*.json 放入 auths/
-
-# 启动（每天 9 点自动签到）
-docker compose up -d --build
-
-# 手动签到
-docker compose exec workbuddy python3 workbuddy_checkin.py signin
-
-# 查看积分
-docker compose exec workbuddy python3 workbuddy_checkin.py credit
+sudo useradd --system --home /var/lib/workbuddy-checkin --shell /usr/sbin/nologin workbuddy
+sudo install -d -o workbuddy -g workbuddy -m 700 /var/lib/workbuddy-checkin/auths
+# 安全传输已登录的凭证文件后：
+sudo install -o workbuddy -g workbuddy -m 600 /secure/path/workbuddy-auth.json /var/lib/workbuddy-checkin/auths/workbuddy-auth.json
+sudo install -m 644 deploy/workbuddy-checkin.service /etc/systemd/system/
+sudo install -m 644 deploy/workbuddy-checkin.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start workbuddy-checkin.service
+sudo systemctl enable --now workbuddy-checkin.timer
+sudo systemctl list-timers workbuddy-checkin.timer
 ```
 
-### 4. 系统 cron 部署
+定时为 `09:07 Asia/Shanghai`，不修改服务器系统时区。服务用专用无登录账号、受限可写目录和权限运行。可选 Bark 地址写入 root 管理、0600 权限的 `/etc/workbuddy-checkin.env`，内容为 `BARK_URL=...`，不要写在命令行或公开配置里。
 
-```bash
-# 每天早上 9 点签到
-0 9 * * * cd /path/to/workbuddy-checkin && python3 workbuddy_checkin.py signin >> /var/log/workbuddy-checkin.log 2>&1
-```
+迁移后停用原来的 GitHub 定时工作流，并确保没有另一个容器/cron 使用同一会话。凭证目录需要受限备份；不要从旧备份恢复已被轮换的 refreshToken。监控 systemd 失败状态或 Bark 失败通知；12153 后重新登录并替换失效凭证。
 
-## 命令一览
+Docker 也可使用现有 compose 的 `./auths:/app/auths` 持久卷。容器需要保护宿主凭证目录，避免同时启动多个使用同一会话的副本。
 
-### login.sh — 交互式登录
+## GitHub Actions：可选部署
 
-| 命令 | 说明 |
+仓库 Settings → Secrets and variables → Actions 配置：
+
+| Secret | 内容 |
 |---|---|
-| `./login.sh` | 交互式选择区域登录 |
-| `./login.sh cn` | 直接登录 CN (codebuddy.cn) |
-| `./login.sh global` | 直接登录 Global (workbuddy.ai) |
-| `./login.sh manual` | 手动输入 Token 保存凭证 |
+| WORKBUDDY_AUTH | 已重新登录、导出的最小 JSON；不是加密信封或旧失效会话 |
+| WORKBUDDY_SECRETS_TOKEN | 仅授权此仓库的 fine-grained PAT：Secrets 读写、Actions 只读；设置到期提醒 |
+| BARK_URL | 可选，Bark 地址 |
 
-### workbuddy_checkin.py — 签到 / 积分管理
+使用 [GitHub Secrets API](https://docs.github.com/en/rest/actions/secrets#create-or-update-a-repository-secret) 所需的 Secrets 写权限；普通工作流 `GITHUB_TOKEN` 不提供这一能力。工作流利用 GitHub 托管 Ubuntu runner 的 `gh` CLI，通过标准输入加密设置 Secret。不要给 PAT 更大的仓库范围。
 
-| 命令 | 说明 |
-|---|---|
-| `signin [auths_dir]` | 批量签到所有 CN 账号 |
-| `credit [uid] [auths_dir] [-j]` | 积分查询（`-j` 输出 JSON） |
-| `trial <uid> [auths_dir]` | 领取 Global trial 加油包 |
-| `refresh [auths_dir]` | 强制刷新所有 token |
-| `cron <hour> [auths_dir]` | 定时模式（每天 hour 点签到） |
+工作流行为：
 
-> `credit` 的首参数智能识别：若传入的是目录路径（已存在或含 `/`），自动视作 `auths_dir` 而非 UID，例如 `credit /path/to/auths` 等价于 `credit "" /path/to/auths`。
+1. 在 runner 临时目录创建受限文件，验证凭证为可用格式的明文最小导出。
+2. 对照运行创建时间与 Secret 的更新时间，拒绝可能持有旧快照的排队任务；需要发起新运行，不能重跑旧任务覆盖新凭证。
+3. 先写回当前凭证验证权限，成功后才允许调用可能轮换 token 的签到/刷新端点。
+4. 每次刷新或 disabled 状态变更立即写回 Secret；失败时保留 runner 本地新文件并让任务报错，末尾再尝试保存。
+5. 最后清理临时文件。不会提交、缓存或上传凭证。跨分支的统一 concurrency group 阻止同仓库工作流并发轮换。
 
-## API 端点映射
+仅适用于**单账号、单 Secret、单一管理者**。运行期间不要从其他机器修改同一 Secret。并发组不能协调桌面客户端、其他仓库或 VPS；不要让这些环境共享同一会话。Runner 突然销毁、GitHub API 长期不可用等情形仍可能丢失最后一次轮换，这是推荐 VPS 的原因。权限过期时任务会在远端刷新前失败，避免静默轮换后丢失。
 
-脚本核心逻辑来自 CPA workbuddy 插件，端点对照：
+仓库默认已停用 GitHub 定时触发，只保留手动入口，日常签到由 VPS 负责。如以后迁回 Actions，先停用 VPS 定时器，再恢复 schedule，例如 UTC 01:07。GitHub [定时事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule) 可能延迟，不承诺北京时间 09:07 准时执行。
 
-| 功能 | 端点 | 来源 |
-|---|---|---|
-| 签到状态 | `POST /v2/billing/meter/checkin-activity-status` | `billing.go fetchCheckinStatus` |
-| 执行签到 | `POST /v2/billing/meter/daily-checkin` | `billing.go performCheckinCall` |
-| 积分查询 | `POST /v2/billing/meter/get-user-resource` | `billing.go fetchUserResource` |
-| Token 刷新 | `POST /v2/plugin/auth/token/refresh` | `keepalive.go refreshCall` |
-| Trial 领取 | `POST /billing/ide/trial` | `billing.go performTrialCall` |
+## 验证与来源
 
-区域路由（`billing.go billingBaseFor`）：
-- CN: `https://www.codebuddy.cn`
-- Global: `https://www.workbuddy.ai`
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-## 生命周期
+测试使用虚构凭证；覆盖明文/混合加密、毫秒到期、GCM 篡改、轮换重新加载、12153、即时 Secret 写回及失败保护、旧快照拒绝、日志脱敏、账号保留和进程互斥。Node 仅用于合成加密信封测试，正常云端运行不需要 Node。PR CI 在 Windows 和 Ubuntu 运行，不读取任何仓库 Secret。
 
-| 状态 | CN 账号 | Global 账号 |
-|---|---|---|
-| 正常 | 支持每日签到 | 不支持签到 |
-| Token 过期 | 自动刷新 | 自动刷新 |
-| 会话失效 (12153) | 标记 disabled，需重新登录 | 标记 disabled，需重新登录 |
-| Trial | 不适用 | 每账号一次，250 积分 |
+解密助手改编自 [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin/blob/main/signin.py)，保留 MIT 版权声明于 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。API 路由保留原有 cpa-plugin/workbuddy 来源。使用固定的 CN / Global 服务地址，不按凭证内容向任意主机发送 token。
 
-## 脱敏
+MIT License。
 
-- 凭证文件 `auths/` 已 gitignore，不会上传
-- 输出日志只显示 UID / Nickname / 积分，不打印 token
-- Token 刷新后原子写回（临时文件 + rename）
-
-## 技术栈
-
-- Python 3.8+（纯标准库，零依赖）
-- `urllib.request` — HTTP 请求
-- `json` — 凭证解析 / API 信封
-- `argparse` — 命令行
-- `base64` — JWT 区域判断
-
-## License
-
-MIT

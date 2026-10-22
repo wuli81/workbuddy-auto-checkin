@@ -1,0 +1,23 @@
+[Unit]
+Description=WorkBuddy daily check-in
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=workbuddy
+Group=workbuddy
+WorkingDirectory=/opt/workbuddy-auto-checkin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/workbuddy-checkin.env
+ExecStart=/usr/bin/python3 /opt/workbuddy-auto-checkin/workbuddy_checkin.py signin /var/lib/workbuddy-checkin/auths
+StateDirectory=workbuddy-checkin
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/workbuddy-checkin
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+TimeoutStartSec=300
