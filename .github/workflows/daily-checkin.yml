@@ -1,9 +1,7 @@
 name: WorkBuddy 每日签到
 
 on:
-  schedule:
-    # UTC 01:07 = 北京时间 09:07；GitHub schedule 可能延迟
-    - cron: '7 1 * * *'
+  # 每日签到已迁至持久化 VPS；仅保留手动入口，避免双端轮换同一会话。
   workflow_dispatch:
 
 permissions:

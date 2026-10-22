@@ -109,7 +109,7 @@ Docker 也可使用现有 compose 的 `./auths:/app/auths` 持久卷。容器需
 
 仅适用于**单账号、单 Secret、单一管理者**。运行期间不要从其他机器修改同一 Secret。并发组不能协调桌面客户端、其他仓库或 VPS；不要让这些环境共享同一会话。Runner 突然销毁、GitHub API 长期不可用等情形仍可能丢失最后一次轮换，这是推荐 VPS 的原因。权限过期时任务会在远端刷新前失败，避免静默轮换后丢失。
 
-GitHub [定时事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule) 可能延迟。保留 UTC 01:07 的原设置，不承诺北京时间 09:07 准时执行。
+仓库默认已停用 GitHub 定时触发，只保留手动入口，日常签到由 VPS 负责。如以后迁回 Actions，先停用 VPS 定时器，再恢复 schedule，例如 UTC 01:07。GitHub [定时事件](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule) 可能延迟，不承诺北京时间 09:07 准时执行。
 
 ## 验证与来源
 
